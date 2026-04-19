@@ -1,0 +1,179 @@
+name: release
+
+# Builds cross-compiled `sendy` binaries for darwin/linux on amd64+arm64
+# and attaches them to a GitHub Release when a `v*` tag is pushed.
+# A workflow_dispatch hook lets maintainers re-run the release against
+# a specific tag from the Actions UI.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag or commit to build (e.g. v0.1.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Derive version
+        id: version
+        run: |
+          REF="${{ github.event.inputs.ref || github.ref_name }}"
+          VERSION="${REF#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          BIN="dist/sendy-${{ matrix.os }}-${{ matrix.arch }}"
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${{ steps.version.outputs.version }}" \
+            -o "$BIN" .
+          ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sendy-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/sendy-${{ matrix.os }}-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum sendy-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.ref || github.ref_name }}
+          files: |
+            dist/sendy-*
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  homebrew:
+    name: bump homebrew formula
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate + publish formula
+        env:
+          TAG: ${{ github.ref_name }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping formula bump."
+            echo "See cvps for the PAT pattern (contents:rw on Achronon/homebrew-sendy-md)."
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          BASE="https://github.com/Achronon/sendy-cli/releases/download/${TAG}"
+          declare -A SHAS=()
+          for target in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+            curl -fsSL "${BASE}/sendy-${target}" -o "/tmp/sendy-${target}"
+            SHAS[${target}]=$(sha256sum "/tmp/sendy-${target}" | awk '{print $1}')
+          done
+          cat > /tmp/sendy.rb <<EOF
+          class Sendy < Formula
+            desc "Command-line client for sendy.md — paste terminal output, get a markdown link"
+            homepage "https://sendy.md"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/sendy-darwin-arm64"
+                sha256 "${SHAS[darwin-arm64]}"
+              end
+              on_intel do
+                url "${BASE}/sendy-darwin-amd64"
+                sha256 "${SHAS[darwin-amd64]}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/sendy-linux-arm64"
+                sha256 "${SHAS[linux-arm64]}"
+              end
+              on_intel do
+                url "${BASE}/sendy-linux-amd64"
+                sha256 "${SHAS[linux-amd64]}"
+              end
+            end
+
+            def install
+              arch = Hardware::CPU.arm? ? "arm64" : "amd64"
+              os = OS.mac? ? "darwin" : "linux"
+              bin.install "sendy-#{os}-#{arch}" => "sendy"
+            end
+
+            def caveats
+              <<~CAVEAT
+                Shell completions can be installed with:
+                  sendy completions bash > \$(brew --prefix)/etc/bash_completion.d/sendy
+                  sendy completions zsh  > \$(brew --prefix)/share/zsh/site-functions/_sendy
+                  sendy completions fish > ~/.config/fish/completions/sendy.fish
+              CAVEAT
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/sendy version").strip
+              assert_match "Usage:", shell_output("#{bin}/sendy help")
+            end
+          end
+          EOF
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Achronon/homebrew-sendy-md.git" /tmp/tap
+          cp /tmp/sendy.rb /tmp/tap/Formula/sendy.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sendy.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes."
+            exit 0
+          fi
+          git commit -m "sendy ${TAG}"
+          git push origin main
