@@ -106,8 +106,10 @@ jobs:
     steps:
       - name: Generate + publish formula
         env:
-          # ref_name is empty on workflow_dispatch; fall back to the input.
-          TAG: ${{ github.ref_name || github.event.inputs.ref }}
+          # On workflow_dispatch from `main`, ref_name is "main" (not
+          # empty), so we prefer the explicit input when it's set and
+          # only fall back to ref_name for tag-push events.
+          TAG: ${{ github.event.inputs.ref || github.ref_name }}
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
