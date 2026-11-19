@@ -1,6 +1,6 @@
 module github.com/Achronon/sendy-cli
 
-go 1.23
+go 1.26.11
 
 require github.com/zalando/go-keyring v0.2.5
 
